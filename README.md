@@ -16,4 +16,7 @@ Installation Steps:
 2. Install Dependencies: We use pandas to easily read the SQL results into a structured table format. Run this command inside the project folder.
    pip install -r requirements.txt
 
-3. 
+3. Launch Jupyter
+   In VS code you can create .ipynb file within the IDE. For pycharm, jupyter notebook opens in a browser.
+
+4. Execute Cells   
