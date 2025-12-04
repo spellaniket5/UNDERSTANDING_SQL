@@ -1,222 +1,239 @@
-# CLINIC MANAGEMENT UI – Rewritten for SQLite
+import sqlite3
 import streamlit as st
 import pandas as pd
-# NOTE: Need to ensure you have 'streamlit', 'pandas', and 'SQLAlchemy' installed:
-# pip install streamlit pandas SQLAlchemy
+from datetime import date
 
-from sqlalchemy import create_engine, text
+# --- Database Setup & Functions ---
+DB_NAME = "clinic.db"
 
-# --- CONFIGURATION (CHANGED FOR SQLITE) ---
-# NOTE: This path must be correct relative to where you run the Streamlit app!
-# Based on your previous setup, the path is relative to the project root.
-SQLITE_DB_PATH = "sqlite:///../Clinic.db" 
-# Use 'sqlite:///Clinic.db' if the file is in the same directory as this script.
+def init_db():
+    """Initializes the DB with the schema provided."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Enable foreign keys
+    c.execute("PRAGMA foreign_keys = ON;")
+    
+    # Create Tables
+    c.execute('''CREATE TABLE IF NOT EXISTS Doctors (
+        doctor_id INTEGER PRIMARY KEY,
+        first_name VARCHAR(50) NOT NULL,
+        specialty VARCHAR(50) NOT NULL,
+        hourly_rate DECIMAL(8, 2)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS Patients (
+        patient_id INTEGER PRIMARY KEY,
+        name VARCHAR(50) NOT NULL,
+        phone VARCHAR(15) UNIQUE
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS Appointments (
+        appoint_id INTEGER PRIMARY KEY,
+        patient_id INT NOT NULL,
+        doctor_id INT NOT NULL,
+        appoint_date DATE NOT NULL,
+        status TEXT CHECK(status IN ('Scheduled', 'Completed', 'Cancelled')),
+        FOREIGN KEY (patient_id) REFERENCES Patients(patient_id),
+        FOREIGN KEY (doctor_id) REFERENCES Doctors(doctor_id)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS Treatments (
+        treatment_id INTEGER PRIMARY KEY,
+        appoint_id INT NOT NULL,
+        service_name VARCHAR(50) NOT NULL,
+        cost DECIMAL(8, 2) NOT NULL,
+        FOREIGN KEY (appoint_id) REFERENCES Appointments(appoint_id)
+    )''')
 
-# Create the SQLAlchemy engine for SQLite
-# SQLite does not use a username/password, just the file path.
-engine = create_engine(SQLITE_DB_PATH)
+    # Seed Data (Only if empty)
+    c.execute("SELECT count(*) FROM Doctors")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO Doctors (first_name, specialty, hourly_rate) VALUES ('Dr. House', 'Diagnostician', 200), ('Dr. Grey', 'Surgeon', 300)")
+        c.execute("INSERT INTO Patients (name, phone) VALUES ('John Doe', '555-0101'), ('Jane Smith', '555-0102')")
+        conn.commit()
 
-# --- CONNECTION TEST ---
-with st.spinner("Connecting to SQLite database..."):
+    conn.close()
+
+def run_query(query, params=()):
+    """Helper to run queries safely."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
     try:
-        # Using a simple query to confirm the connection is active
-        pd.read_sql("SELECT 1", engine)
-        st.success("Successfully connected to the Clinic database!")
-    except Exception as e:
-        st.error(f"Cannot connect to the database file: {e}")
-        st.error(f"Please ensure the database file exists at the path: {SQLITE_DB_PATH}")
-        st.stop()
-        
-# --- STREAMLIT UI ---
-st.title("🏥 Clinic Management System")
-st.caption("Simple UI to manage Doctors, Patients, Appointments, and Treatments.")
-
-menu = st.sidebar.selectbox("Go to", [
-    "Doctors", "Patients", "Appointments", "Treatments", "Raw SQL"
-])
-
-# Utility function to handle INSERT and RERUN
-def execute_query(sql_query, params=None, success_msg="Operation successful!"):
-    try:
-        with engine.begin() as conn:
-            if params:
-                conn.execute(sql_query, params)
-            else:
-                conn.execute(sql_query)
-        st.success(success_msg)
-        st.rerun()
+        c.execute(query, params)
+        conn.commit()
+        return c
     except Exception as e:
         st.error(f"Database Error: {e}")
+    finally:
+        conn.close()
 
+def get_df(query, params=()):
+    """Helper to get data as a Pandas DataFrame for display."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        df = pd.read_sql_query(query, conn, params=params)
+        return df
+    finally:
+        conn.close()
 
-# DOCTORS
-if menu == "Doctors":
-    st.subheader("👨‍⚕️ Doctors")
+# --- The UI Application ---
+
+st.set_page_config(page_title="Clinic Manager", layout="wide")
+init_db() # Ensure DB exists on load
+
+st.title("🏥 Clinic Management System")
+st.markdown("---")
+
+# Sidebar for Navigation
+menu = st.sidebar.radio("Navigate", ["Dashboard", "Manage Appointments", "Patient Records", "Billing & Treatments"])
+
+# --- TAB 1: DASHBOARD ---
+if menu == "Dashboard":
+    st.header("Daily Overview")
     
-    # READ/DISPLAY
-    if st.button("Refresh Doctors", key="refresh_docs"):
-        df = pd.read_sql("SELECT * FROM Doctors ORDER BY doctor_id", engine)
-        st.dataframe(df, use_container_width=True)
+    col1, col2, col3 = st.columns(3)
+    
+    # Metric: Total Appointments
+    count_appt = get_df("SELECT COUNT(*) as count FROM Appointments").iloc[0]['count']
+    col1.metric("Total Appointments", count_appt)
+    
+    # Metric: Total Patients
+    count_pat = get_df("SELECT COUNT(*) as count FROM Patients").iloc[0]['count']
+    col2.metric("Total Patients", count_pat)
+    
+    # Metric: Revenue
+    revenue = get_df("SELECT SUM(cost) as total FROM Treatments").iloc[0]['total']
+    revenue = revenue if revenue else 0
+    col3.metric("Total Revenue", f"${revenue:,.2f}")
 
-    # CREATE/ADD NEW DOCTOR
-    with st.expander("➕ Add new doctor"):
-        with st.form("add_doctor"):
+    st.subheader("Recent Activity")
+    df_recent = get_df("""
+        SELECT A.appoint_date, P.name as Patient, D.first_name as Doctor, A.status 
+        FROM Appointments A
+        JOIN Patients P ON A.patient_id = P.patient_id
+        JOIN Doctors D ON A.doctor_id = D.doctor_id
+        ORDER BY A.appoint_date DESC LIMIT 5
+    """)
+    st.dataframe(df_recent, use_container_width=True)
+
+# --- TAB 2: MANAGE APPOINTMENTS ---
+elif menu == "Manage Appointments":
+    st.header("📅 Appointment Center")
+    
+    # Form to Add Appointment
+    with st.expander("Book New Appointment"):
+        with st.form("book_appt"):
             col1, col2 = st.columns(2)
-            with col1:
-                fname = st.text_input("First name", max_chars=50)
-                specialty = st.text_input("Specialty", placeholder="e.g. Cardiology", max_chars=50)
-            with col2:
-                rate = st.number_input("Hourly rate ($)", min_value=0.0, format="%.2f")
             
-            if st.form_submit_button("Save doctor"):
-                if not fname or not specialty:
-                    st.error("First name and Specialty are required.")
-                else:
-                    # NOTE: SQLite uses '?' as the placeholder, but SQLAlchemy's text() works with %s,
-                    # which it translates properly for SQLite/MySQL/etc., but we will use '?' for clean SQLite
-                    # The original %s will work with SQLAlchemy when using the conn.execute() method as a proxy.
-                    sql = text("INSERT INTO Doctors (first_name, specialty, hourly_rate) VALUES (:fname, :spec, :rate)")
-                    execute_query(sql, {"fname": fname, "spec": specialty, "rate": rate}, "Doctor added!")
+            # Fetch lists for dropdowns (Abstracting IDs)
+            pats = get_df("SELECT patient_id, name FROM Patients")
+            docs = get_df("SELECT doctor_id, first_name FROM Doctors")
+            
+            pat_dict = dict(zip(pats['name'], pats['patient_id']))
+            doc_dict = dict(zip(docs['first_name'], docs['doctor_id']))
+            
+            sel_pat = col1.selectbox("Select Patient", pat_dict.keys())
+            sel_doc = col2.selectbox("Select Doctor", doc_dict.keys())
+            date_input = st.date_input("Date")
+            
+            submitted = st.form_submit_button("Book Appointment")
+            if submitted:
+                run_query("INSERT INTO Appointments (patient_id, doctor_id, appoint_date, status) VALUES (?, ?, ?, ?)",
+                          (pat_dict[sel_pat], doc_dict[sel_doc], date_input, 'Scheduled'))
+                st.success(f"Appointment booked for {sel_pat} with {sel_doc}!")
+                st.rerun()
 
-# PATIENTS
-if menu == "Patients":
-    st.subheader("🧑‍🦱 Patients")
+    # View Appointments Table
+    st.subheader("Scheduled Appointments")
     
-    # READ/DISPLAY
-    if st.button("Refresh Patients", key="refresh_pats"):
-        df = pd.read_sql("SELECT * FROM Patients ORDER BY patient_id DESC", engine)
-        st.dataframe(df, use_container_width=True)
-
-    # CREATE/REGISTER NEW PATIENT
-    with st.expander("➕ Register new patient"):
-        with st.form("add_patient"):
-            name = st.text_input("Full name", max_chars=50)
-            phone = st.text_input("Phone", placeholder="e.g. 9848000001", max_chars=15)
-            
-            if st.form_submit_button("Register patient"):
-                if not name or not phone:
-                    st.error("Name and phone required")
-                else:
-                    sql = text("INSERT INTO Patients (name, phone) VALUES (:name, :phone)")
-                    execute_query(sql, {"name": name, "phone": phone}, f"Patient {name} registered!")
-
-
-# APPOINTMENTS
-if menu == "Appointments":
-    st.subheader("🗓️ Appointments")
+    # Filter by Status
+    status_filter = st.selectbox("Filter by Status", ["All", "Scheduled", "Completed", "Cancelled"])
     
-    # READ/DISPLAY
-    if st.button("Refresh Appointments", key="refresh_apps"):
-        query = """
-        SELECT a.appoint_id,
-              p.name AS patient,
-              d.first_name AS doctor,
-              d.specialty,
-              a.appoint_date,
-              a.status
-        FROM Appointments a
-        JOIN Patients p ON a.patient_id = p.patient_id
-        JOIN Doctors d ON a.doctor_id = d.doctor_id
-        ORDER BY a.appoint_date DESC, a.appoint_id DESC
-        """
-        df = pd.read_sql(query, engine)
-        st.dataframe(df, use_container_width=True)
-
-    # CREATE/BOOK NEW APPOINTMENT
-    with st.expander("➕ Book new appointment"):
-        with st.form("new_appointment"):
-            # Fetch lists for selection boxes
-            patients = pd.read_sql("SELECT patient_id, name FROM Patients", engine)
-            doctors = pd.read_sql("SELECT doctor_id, first_name, specialty FROM Doctors", engine)
-
-            # Dropdown options
-            patient_name_list = patients["name"].tolist()
-            doctor_combo_list = doctors.apply(lambda x: f"Dr. {x.first_name} - {x.specialty}", axis=1).tolist()
-            
-            patient_name = st.selectbox("Patient", patient_name_list, key="pat_select")
-            doctor_combo = st.selectbox("Doctor", doctor_combo_list, key="doc_select")
-            
-            appoint_date = st.date_input("Appointment date")
-            status = st.selectbox("Status", ["Scheduled", "Completed", "Cancelled"])
-
-            if st.form_submit_button("Book appointment"):
-                # Get actual IDs based on selected names/combos
-                pat_id = patients.loc[patients["name"] == patient_name, "patient_id"].iloc[0]
-                doc_id = doctors.loc[doctors.apply(lambda x: f"Dr. {x.first_name} - {x.specialty}", axis=1) == doctor_combo, "doctor_id"].iloc[0]
-                
-                sql = text("INSERT INTO Appointments (patient_id, doctor_id, appoint_date, status) VALUES (:pat_id, :doc_id, :app_date, :status)")
-                params = {"pat_id": pat_id, "doc_id": doc_id, "app_date": appoint_date, "status": status}
-                
-                execute_query(sql, params, "Appointment booked!")
-
-# TREATMENTS
-if menu == "Treatments":
-    st.subheader("💉 Treatments / Services Performed")
+    base_query = """
+        SELECT A.appoint_id, A.appoint_date, P.name as Patient, D.first_name as Doctor, A.status 
+        FROM Appointments A
+        JOIN Patients P ON A.patient_id = P.patient_id
+        JOIN Doctors D ON A.doctor_id = D.doctor_id
+    """
     
-    # READ/DISPLAY
-    if st.button("Refresh Treatments", key="refresh_treat"):
-        query = """
-        SELECT t.treatment_id, t.service_name, t.cost,
-               a.appoint_date,
-               p.name AS patient,
-               d.first_name AS doctor
-        FROM Treatments t
-        JOIN Appointments a ON t.appoint_id = a.appoint_id
-        JOIN Patients p ON a.patient_id = p.patient_id
-        JOIN Doctors d ON a.doctor_id = d.doctor_id
-        ORDER BY t.treatment_id DESC
-        """
-        df = pd.read_sql(query, engine)
-        st.dataframe(df, use_container_width=True)
-
-    # CREATE/ADD NEW TREATMENT
-    with st.expander("➕ Add treatment (after appointment)"):
-        with st.form("add_treatment"):
-            # Fetch appointments for selection
-            appointments = pd.read_sql("""
-                SELECT appoint_id, 
-                       DATE(appoint_date) as date,
-                       p.name, d.first_name
-                FROM Appointments a
-                JOIN Patients p ON a.patient_id = p.patient_id
-                JOIN Doctors d ON a.doctor_id = d.doctor_id
-            """, engine)
-
-            # Create readable appointment choice string
-            appoint_choice_list = appointments.apply(lambda x: f"{x.date} - {x.name} with Dr. {x.first_name}", axis=1).tolist()
-            
-            appoint_choice = st.selectbox("Appointment", appoint_choice_list)
-            
-            # Find the ID of the chosen appointment
-            appoint_id = appointments.loc[appointments.apply(lambda x: f"{x.date} - {x.name} with Dr. {x.first_name}", axis=1) == appoint_choice, "appoint_id"].iloc[0]
-
-            service = st.text_input("Service name", max_chars=50)
-            cost = st.number_input("Cost ($)", min_value=0.0, format="%.2f")
-
-            if st.form_submit_button("Record treatment"):
-                if not service:
-                    st.error("Service name is required.")
-                else:
-                    sql = text("INSERT INTO Treatments (appoint_id, service_name, cost) VALUES (:app_id, :service, :cost)")
-                    params = {"app_id": appoint_id, "service": service, "cost": cost}
-                    execute_query(sql, params, "Treatment recorded!")
-
-# RAW SQL
-if menu == "Raw SQL":
-    st.subheader("💻 Raw SQL Query Interface")
-    st.warning("Danger zone – full SQL access. Use SELECT for read operations only.")
-    q = st.text_area("Query", "SELECT * FROM Appointments LIMIT 5", height=150)
-    
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        run_button = st.button("Run SELECT Query")
-    with col2:
-        st.caption("Only SELECT queries are fully supported here.")
+    if status_filter != "All":
+        df_appt = get_df(base_query + " WHERE A.status = ?", (status_filter,))
+    else:
+        df_appt = get_df(base_query)
         
-    if run_button:
-        try:
-            df = pd.read_sql(q, engine)
-            st.dataframe(df, use_container_width=True)
-            st.info(f"{len(df)} rows returned.")
-        except Exception as e:
-            st.error(f"SQL Error: {e}")
+    st.dataframe(df_appt, use_container_width=True, hide_index=True)
+    
+    # Quick Action: Update Status
+    st.markdown("### Update Status")
+    c1, c2, c3 = st.columns([1, 2, 1])
+    appt_id_input = c1.number_input("Enter Appointment ID", min_value=1, step=1)
+    new_status = c2.selectbox("New Status", ["Completed", "Cancelled"])
+    if c3.button("Update"):
+        run_query("UPDATE Appointments SET status = ? WHERE appoint_id = ?", (new_status, appt_id_input))
+        st.success("Status updated.")
+        st.rerun()
+
+# --- TAB 3: PATIENT RECORDS ---
+elif menu == "Patient Records":
+    st.header("👤 Patient Directory")
+    
+    # Add Patient
+    with st.expander("Register New Patient"):
+        with st.form("new_pat"):
+            name = st.text_input("Full Name")
+            phone = st.text_input("Phone Number")
+            if st.form_submit_button("Register"):
+                run_query("INSERT INTO Patients (name, phone) VALUES (?, ?)", (name, phone))
+                st.success("Patient registered!")
+                st.rerun()
+    
+    # Search Patient
+    search_term = st.text_input("Search Patient by Name")
+    if search_term:
+        df_pat = get_df("SELECT * FROM Patients WHERE name LIKE ?", (f'%{search_term}%',))
+    else:
+        df_pat = get_df("SELECT * FROM Patients")
+    
+    st.dataframe(df_pat, use_container_width=True)
+
+# --- TAB 4: BILLING ---
+elif menu == "Billing & Treatments":
+    st.header("💰 Billing & Treatments")
+    
+    # Add Treatment to Appointment
+    st.subheader("Add Charge to Appointment")
+    
+    # Only show appointments that aren't cancelled
+    appts = get_df("""
+        SELECT A.appoint_id, P.name, A.appoint_date 
+        FROM Appointments A 
+        JOIN Patients P ON A.patient_id = P.patient_id 
+        WHERE A.status != 'Cancelled'
+    """)
+    
+    if not appts.empty:
+        # Create a readable string for the dropdown
+        appts['display'] = "ID " + appts['appoint_id'].astype(str) + " - " + appts['name'] + " (" + appts['appoint_date'] + ")"
+        appt_dict = dict(zip(appts['display'], appts['appoint_id']))
+        
+        selected_appt_display = st.selectbox("Select Appointment", appt_dict.keys())
+        service = st.text_input("Service Name (e.g., General Checkup)")
+        cost = st.number_input("Cost ($)", min_value=0.0, step=10.0)
+        
+        if st.button("Add Charge"):
+            run_query("INSERT INTO Treatments (appoint_id, service_name, cost) VALUES (?, ?, ?)", 
+                      (appt_dict[selected_appt_display], service, cost))
+            st.success("Charge added successfully!")
+    else:
+        st.info("No active appointments found.")
+
+    st.markdown("---")
+    st.subheader("Transaction Log")
+    df_treat = get_df("""
+        SELECT T.treatment_id, P.name as Patient, T.service_name, T.cost 
+        FROM Treatments T
+        JOIN Appointments A ON T.appoint_id = A.appoint_id
+        JOIN Patients P ON A.patient_id = P.patient_id
+    """)
+    st.dataframe(df_treat, use_container_width=True)
